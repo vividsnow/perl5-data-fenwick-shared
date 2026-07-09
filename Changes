@@ -1,0 +1,9 @@
+Revision history for Data-Fenwick-Shared
+
+0.01      2026-07-10
+          - Initial release. Shared-memory Fenwick tree (binary indexed tree):
+            O(log n) point update and prefix-sum query over n signed int64
+            positions, plus range/point/total, set, and a find (binary-lifting
+            rank / weighted-sample lookup). Backed by a file, anonymous mapping,
+            or memfd; write-preferring rwlock with dead-process recovery;
+            element-wise merge. Linux, 64-bit Perl.
