@@ -1,5 +1,10 @@
 Revision history for Data-Fenwick-Shared
 
+0.02      2026-07-12
+          - Add range-update mode (new_range / new_range_memfd): range_add and
+            O(log n) range queries via the two-BIT technique. Backward compatible
+            (default point mode unchanged; 0.01 files open as before).
+
 0.01      2026-07-10
           - Initial release. Shared-memory Fenwick tree (binary indexed tree):
             O(log n) point update and prefix-sum query over n signed int64

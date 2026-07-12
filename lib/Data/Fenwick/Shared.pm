@@ -1,7 +1,7 @@
 package Data::Fenwick::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::Fenwick::Shared', $VERSION);
 
@@ -13,7 +13,7 @@ __END__
 
 =head1 NAME
 
-Data::Fenwick::Shared - shared-memory Fenwick tree (binary indexed tree) for Linux
+Data::Fenwick::Shared - shared-memory Fenwick tree (binary indexed tree; point or range update) for Linux
 
 =head1 SYNOPSIS
 
@@ -37,6 +37,11 @@ Data::Fenwick::Shared - shared-memory Fenwick tree (binary indexed tree) for Lin
 
     # share across processes via a backing file
     my $shared = Data::Fenwick::Shared->new("/tmp/counts.fen", 1_000_000);
+
+    # range-update mode: add to a whole range in O(log n), then query ranges
+    my $rng = Data::Fenwick::Shared->new_range(undef, 1_000_000);
+    $rng->range_add(10, 20, 5);   # add 5 to every position in [10, 20]
+    $rng->range(10, 20);          # 55  (sum over the range)
 
 =head1 DESCRIPTION
 
@@ -68,6 +73,20 @@ Values are signed 64-bit integers; sums that overflow 64 bits wrap, as with any
 native integer arithmetic. Memory is C<(n+1) * 8> bytes for the tree plus a
 fixed header. B<Linux-only>. Requires 64-bit Perl.
 
+=head2 Range-update mode
+
+A tree created with C<new_range> supports B<range update> as well as range query:
+C<range_add($l, $r, $delta)> adds a delta to every position in C<[$l, $r]> in
+C<O(log n)>, and C<prefix>/C<range>/C<point>/C<total> report the resulting sums.
+It uses the classic B<two-BIT> technique (a second binary indexed tree tracking
+the weighted difference), so a range-mode tree costs B<twice the memory>
+(C<2 * (n+1) * 8> bytes) but adds O(log n) range updates a plain Fenwick tree
+cannot do. C<update($i, $delta)> and C<set> still work (a point update is just
+C<range_add($i, $i, $delta)>). C<find> and C<merge> are B<not> available in range
+mode (the two-BIT layout has no single-BIT binary lift); use a point tree for
+those. The mode is recorded in the header, so a reopened segment stays range mode,
+and it is backward-compatible -- a 0.01 point-mode file opens unchanged.
+
 =head1 METHODS
 
 =head2 Constructors
@@ -76,6 +95,10 @@ fixed header. B<Linux-only>. Requires 64-bit Perl.
     my $fen = Data::Fenwick::Shared->new(undef, $n);            # anonymous
     my $fen = Data::Fenwick::Shared->new_memfd($name, $n);
     my $fen = Data::Fenwick::Shared->new_from_fd($fd);
+
+    # range-update mode (two BITs) -- same arguments
+    my $fen = Data::Fenwick::Shared->new_range($path, $n);
+    my $fen = Data::Fenwick::Shared->new_range_memfd($name, $n);
 
 C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$n> is the number of positions (at least 1); positions are then addressed as
@@ -89,11 +112,14 @@ defaults to C<0600> (owner-only).
 
 =head2 Updating
 
-    $fen->update($i, $delta);       # add $delta at position $i (1 <= $i <= n)
-    my $old = $fen->set($i, $value); # set position $i to $value; returns the old value
-    $fen->clear;                     # reset every position to 0
+    $fen->update($i, $delta);        # add $delta at position $i (1 <= $i <= n)
+    $fen->range_add($l, $r, $delta);  # add $delta to every position in [$l, $r] (range mode)
+    my $old = $fen->set($i, $value);  # set position $i to $value; returns the old value
+    $fen->clear;                      # reset every position to 0
 
-C<update> adds a signed delta at a single position and returns nothing. C<set>
+C<range_add> adds a delta to a whole inclusive range in C<O(log n)> and requires
+a B<range-mode> tree (C<new_range>); it croaks on a point-mode tree. C<update>
+adds a signed delta at a single position and returns nothing. C<set>
 overwrites a position with an absolute value and returns its previous value (it
 is C<update($i, $value - point($i))> done atomically under one lock). Both croak
 if C<$i> is outside C<1..n>. C<clear> zeroes the whole tree.
@@ -112,19 +138,22 @@ whose prefix sum is at least C<$target>, returning that position or C<n+1> if no
 prefix reaches it. C<find> is only meaningful when every stored value is
 non-negative (a cumulative distribution): it is the core of weighted sampling
 (draw C<$target> uniformly in C<[1, total]> and C<find> the bucket) and of
-order-statistic / rank queries. Out-of-range positions croak.
+order-statistic / rank queries. Out-of-range positions croak. C<find> requires a
+B<point-mode> tree (it croaks in range mode).
 
 =head2 Merging, introspection, lifecycle
 
-    $fen->merge($other);            # element-wise add (both must have equal n)
+    $fen->merge($other);            # element-wise add (point mode; both must have equal n)
     $fen->size;                     # n, the number of positions
-    $fen->stats;                    # { size, total, ops, mmap_size }
+    $fen->is_range;                 # true for a range-mode (two-BIT) tree
+    $fen->stats;                    # { size, total, ops, mmap_size, range }
     $fen->path; $fen->memfd; $fen->sync; $fen->unlink;
 
 C<merge> adds another tree's contents into this one position by position; both
-trees must have the same C<n> or it croaks. The other tree is snapshotted under
-its own read lock, so two processes may merge concurrently without deadlock.
-C<size> (also C<capacity>) is C<n>. C<sync> flushes the mapping to its backing
+trees must have the same C<n> or it croaks, and both must be B<point-mode>
+(C<merge> croaks in range mode). The other tree is snapshotted under its own read
+lock, so two processes may merge concurrently without deadlock. C<is_range>
+reports whether the tree is range mode. C<size> (also C<capacity>) is C<n>. C<sync> flushes the mapping to its backing
 store (a no-op for anonymous and memfd trees); C<unlink> removes the backing file
 (also callable as C<< Class->unlink($path) >>); C<path> returns the backing path
 (C<undef> for anonymous, memfd, or fd-reopened trees) and C<memfd> the backing
@@ -135,8 +164,8 @@ C<new_from_fd> tree, and -1 for file-backed or anonymous trees.
 
 C<stats()> returns a hashref: C<size> (the number of positions C<n>), C<total>
 (the current sum of all positions), C<ops> (running count of write-path calls --
-C<update>, C<set>, C<merge>, C<clear>), and C<mmap_size> (bytes of the shared
-mapping).
+C<update>, C<range_add>, C<set>, C<merge>, C<clear>), C<mmap_size> (bytes of the
+shared mapping), and C<range> (1 for a range-mode tree, 0 for a point-mode tree).
 
 =head1 SHARING ACROSS PROCESSES
 

@@ -51,6 +51,9 @@
 #define FEN_MIN_N        1
 #define FEN_MAX_N        0x100000000ULL /* 2^32 positions; (n+1)*8-byte tree cap (~32 GiB) */
 
+#define FEN_MODE_POINT   0U   /* single BIT: point update + prefix/range query */
+#define FEN_MODE_RANGE   1U   /* two BITs: range update (range_add) + range query */
+
 #define FEN_ERR(fmt, ...) do { if (errbuf) snprintf(errbuf, FEN_ERR_BUFLEN, fmt, ##__VA_ARGS__); } while (0)
 
 /* ================================================================
@@ -71,10 +74,10 @@ typedef struct {
 
 struct FenHeader {
     uint32_t magic, version;          /* 0,4 */
-    uint32_t _pad0;                   /* 8 */
+    uint32_t mode;                    /* 8   FEN_MODE_POINT | FEN_MODE_RANGE */
     uint32_t _pad1;                   /* 12 */
     uint64_t n;                       /* 16  number of positions (1..n); tree has n+1 int64 slots */
-    uint64_t _reserved0;              /* 24 */
+    uint64_t tree2_off;               /* 24  second BIT (range mode; 0 in point mode) */
     uint64_t capacity;                /* 32  == n (kept for family stats parity) */
     uint64_t _reserved1;              /* 40 */
     uint64_t total_size;              /* 48 */
@@ -98,6 +101,8 @@ typedef struct FenHandle {
     FenReaderSlot *reader_slots;  /* FEN_READER_SLOTS entries */
     void         *base;          /* mmap base */
     uint64_t      tree_off;      /* validated tree-array offset, cached: never re-read from the peer-writable header */
+    uint64_t      tree2_off;     /* second BIT offset (range mode), cached; 0 in point mode */
+    uint32_t      mode;          /* FEN_MODE_* (cached from validated header) */
     size_t        mmap_size;
     char         *path;          /* backing file path (strdup'd) */
     int           backing_fd;    /* memfd or reopened-fd to close on destroy, -1 for file/anon */
@@ -524,13 +529,19 @@ static inline FenLayout fen_layout(void) {
     return L;
 }
 
-/* the tree is 1-indexed: n+1 int64 slots, slot 0 unused */
-static inline uint64_t fen_total_size(uint64_t n) {
+/* the tree is 1-indexed: n+1 int64 slots, slot 0 unused.  Range mode appends a
+ * second BIT of the same shape right after the first. */
+static inline uint64_t fen_tree2_off_for(uint64_t n, uint32_t mode) {
+    if (mode != FEN_MODE_RANGE) return 0;
+    return fen_layout().tree + (n + 1) * sizeof(int64_t);
+}
+static inline uint64_t fen_total_size(uint64_t n, uint32_t mode) {
     FenLayout L = fen_layout();
-    return L.tree + (n + 1) * sizeof(int64_t);
+    uint64_t trees = (mode == FEN_MODE_RANGE) ? 2 : 1;
+    return L.tree + trees * (n + 1) * sizeof(int64_t);
 }
 
-static inline void fen_init_header(void *base, uint64_t n, uint64_t total) {
+static inline void fen_init_header(void *base, uint64_t n, uint32_t mode, uint64_t total) {
     FenLayout L = fen_layout();
     FenHeader *hdr = (FenHeader *)base;
     /* Zero the header + reader-slot region (lock-recovery state); the tree array
@@ -538,11 +549,13 @@ static inline void fen_init_header(void *base, uint64_t n, uint64_t total) {
     memset(base, 0, (size_t)L.tree);
     hdr->magic            = FEN_MAGIC;
     hdr->version          = FEN_VERSION;
+    hdr->mode             = mode;
     hdr->n                = n;
     hdr->capacity         = n;
     hdr->total_size       = total;
     hdr->reader_slots_off = L.reader_slots;
     hdr->tree_off         = L.tree;
+    hdr->tree2_off        = fen_tree2_off_for(n, mode);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -574,6 +587,8 @@ static inline FenHandle *fen_setup(void *base, size_t map_size,
     h->base         = base;
     h->reader_slots = (FenReaderSlot *)((uint8_t *)base + hdr->reader_slots_off);
     h->tree_off     = hdr->tree_off;   /* single validated read; bound and pointer stay consistent */
+    h->tree2_off    = hdr->tree2_off;
+    h->mode         = hdr->mode;
     h->mmap_size    = map_size;
     h->path         = path ? strdup(path) : NULL;
     h->backing_fd   = backing_fd;
@@ -585,10 +600,12 @@ static inline FenHandle *fen_setup(void *base, size_t map_size,
 static inline int fen_validate_header(const FenHeader *hdr, uint64_t file_size) {
     if (hdr->magic != FEN_MAGIC) return 0;
     if (hdr->version != FEN_VERSION) return 0;
+    if (hdr->mode != FEN_MODE_POINT && hdr->mode != FEN_MODE_RANGE) return 0;
     if (hdr->n < FEN_MIN_N || hdr->n > FEN_MAX_N) return 0;
     if (hdr->capacity != hdr->n) return 0;
+    if (hdr->tree2_off != fen_tree2_off_for(hdr->n, hdr->mode)) return 0;
     if (hdr->total_size != file_size) return 0;
-    if (hdr->total_size != fen_total_size(hdr->n)) return 0;
+    if (hdr->total_size != fen_total_size(hdr->n, hdr->mode)) return 0;
     FenLayout L = fen_layout();
     if (hdr->reader_slots_off != L.reader_slots) return 0;
     if (hdr->tree_off != L.tree) return 0;
@@ -625,10 +642,10 @@ static int fen_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
-static FenHandle *fen_create(const char *path, uint64_t n, mode_t mode, char *errbuf) {
+static FenHandle *fen_create(const char *path, uint64_t n, uint32_t fmode, mode_t mode, char *errbuf) {
     if (!fen_validate_n(n, errbuf)) return NULL;
 
-    uint64_t total = fen_total_size(n);
+    uint64_t total = fen_total_size(n, fmode);
     int anonymous = (path == NULL);
     int fd = -1;
     size_t map_size;
@@ -663,15 +680,15 @@ static FenHandle *fen_create(const char *path, uint64_t n, mode_t mode, char *er
             return fen_setup(base, map_size, path, -1);
         }
     }
-    fen_init_header(base, n, total);
+    fen_init_header(base, n, fmode, total);
     if (fd >= 0) { flock(fd, LOCK_UN); close(fd); }
     return fen_setup(base, map_size, path, -1);
 }
 
-static FenHandle *fen_create_memfd(const char *name, uint64_t n, char *errbuf) {
+static FenHandle *fen_create_memfd(const char *name, uint64_t n, uint32_t fmode, char *errbuf) {
     if (!fen_validate_n(n, errbuf)) return NULL;
 
-    uint64_t total = fen_total_size(n);
+    uint64_t total = fen_total_size(n, fmode);
     int fd = memfd_create(name ? name : "fenwick", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { FEN_ERR("memfd_create: %s", strerror(errno)); return NULL; }
     if (ftruncate(fd, (off_t)total) < 0) {
@@ -680,7 +697,7 @@ static FenHandle *fen_create_memfd(const char *name, uint64_t n, char *errbuf) {
     (void)fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
     void *base = mmap(NULL, (size_t)total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { FEN_ERR("mmap: %s", strerror(errno)); close(fd); return NULL; }
-    fen_init_header(base, n, total);
+    fen_init_header(base, n, fmode, total);
     return fen_setup(base, (size_t)total, NULL, fd);
 }
 
@@ -792,9 +809,84 @@ static void fen_merge_locked(FenHandle *dst, const int64_t *src, uint64_t src_sl
 /* reset all positions to 0 (caller holds the write lock) */
 static inline void fen_clear_locked(FenHandle *h) {
     uint64_t slots = h->hdr->n + 1;
+    if (h->mode == FEN_MODE_RANGE) slots *= 2;       /* both BITs are contiguous after tree_off */
     uint64_t slots_max = fen_tree_slots_max(h);      /* Layer B: clamp memset to the mapping */
     if (slots > slots_max) slots = slots_max;
     memset(fen_tree(h), 0, (size_t)(slots * sizeof(int64_t)));
+}
+
+/* ================================================================
+ * Range mode: two BITs (B1 = fen_tree, B2 = fen_tree2) give O(log n) range
+ * update AND range query.  range_add(l,r,d): B1 += d@l, -d@(r+1); B2 += d*(l-1)@l,
+ * -d*r@(r+1).  prefix(i) = B1.prefix(i)*i - B2.prefix(i).  The r+1==n+1 sentinel
+ * write is safely dropped -- it would only affect prefixes beyond n, never queried.
+ * ================================================================ */
+
+static inline int64_t *fen_tree2(FenHandle *h) {
+    return (int64_t *)((char *)h->base + h->tree2_off);
+}
+/* Layer B trusted bound: int64 slots guaranteed within the mapping past tree2_off */
+static inline uint64_t fen_tree2_slots_max(FenHandle *h) {
+    uint64_t off = h->tree2_off;
+    if (off == 0 || off >= h->mmap_size) return 0;
+    return (h->mmap_size - off) / sizeof(int64_t);
+}
+/* highest 1-based index safely inside BOTH BIT arrays (range mode) */
+static inline uint64_t fen_range_nmax(FenHandle *h) {
+    uint64_t nn = h->hdr->n;
+    uint64_t s1 = fen_tree_slots_max(h),  hi1 = s1 ? s1 - 1 : 0;
+    uint64_t s2 = fen_tree2_slots_max(h), hi2 = s2 ? s2 - 1 : 0;
+    uint64_t hi = hi1 < hi2 ? hi1 : hi2;
+    return nn < hi ? nn : hi;
+}
+/* BIT primitives on an explicit tree array, bounded by nmax (1-based) */
+static inline void fen_bit_add(int64_t *tree, uint64_t i, int64_t delta, uint64_t nmax) {
+    for (uint64_t x = i; x >= 1 && x <= nmax; x += fen_lowbit(x)) tree[x] += delta;
+}
+static inline int64_t fen_bit_prefix(const int64_t *tree, uint64_t i, uint64_t nmax) {
+    if (i > nmax) i = nmax;
+    int64_t s = 0;
+    for (uint64_t x = i; x > 0; x -= fen_lowbit(x)) s += tree[x];
+    return s;
+}
+/* add delta to every position in [l,r] (1-based); caller holds the write lock */
+static void fen_range_add_locked(FenHandle *h, uint64_t l, uint64_t r, int64_t delta) {
+    int64_t *b1 = fen_tree(h), *b2 = fen_tree2(h);
+    uint64_t nmax = fen_range_nmax(h);
+    if (l < 1) l = 1;
+    if (r > nmax) r = nmax;
+    if (l > r) return;
+    fen_bit_add(b1, l, delta, nmax);
+    fen_bit_add(b2, l, delta * (int64_t)(l - 1), nmax);
+    if (r + 1 <= nmax) {                              /* drop the r+1==n+1 sentinel: never queried */
+        fen_bit_add(b1, r + 1, -delta, nmax);
+        fen_bit_add(b2, r + 1, -delta * (int64_t)r, nmax);
+    }
+}
+/* prefix sum over 1..i (range mode); caller holds a lock */
+static int64_t fen_range_prefix_locked(FenHandle *h, uint64_t i) {
+    uint64_t nmax = fen_range_nmax(h);
+    if (i > nmax) i = nmax;
+    int64_t p1 = fen_bit_prefix(fen_tree(h),  i, nmax);
+    int64_t p2 = fen_bit_prefix(fen_tree2(h), i, nmax);
+    return p1 * (int64_t)i - p2;
+}
+/* sum over l..r inclusive (range mode); caller holds a lock */
+static int64_t fen_range_range_locked(FenHandle *h, uint64_t l, uint64_t r) {
+    if (l < 1) l = 1;
+    return fen_range_prefix_locked(h, r) - fen_range_prefix_locked(h, l - 1);
+}
+
+/* ---- mode-dispatching wrappers used by the XS (point vs range) ---- */
+static inline void fen_add1_locked(FenHandle *h, uint64_t i, int64_t d) {
+    if (h->mode == FEN_MODE_RANGE) fen_range_add_locked(h, i, i, d);   /* point add == range_add(i,i) */
+    else                           fen_update_locked(h, i, d);
+}
+static inline int64_t fen_pref_locked(FenHandle *h, uint64_t i) {
+    return (h->mode == FEN_MODE_RANGE) ? fen_range_prefix_locked(h, i) : fen_prefix_locked(h, i);
+}
+static inline int64_t fen_rng_locked(FenHandle *h, uint64_t l, uint64_t r) {
+    return (h->mode == FEN_MODE_RANGE) ? fen_range_range_locked(h, l, r) : fen_range_locked(h, l, r);
 }
 
 #endif /* FEN_H */

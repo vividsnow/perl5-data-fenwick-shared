@@ -42,7 +42,7 @@ new(class, path = &PL_sv_undef, n = 0, ...)
      * (default 0600, owner-only). Pass e.g. 0660 to opt into cross-user
      * sharing. Ignored for anonymous segments and existing files. */
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
-    FenHandle *hh = fen_create(p, (uint64_t)n, mode, errbuf);
+    FenHandle *hh = fen_create(p, (uint64_t)n, FEN_MODE_POINT, mode, errbuf);
     if (!hh) croak("Data::Fenwick::Shared->new: %s", errbuf);
     MAKE_OBJ(class, hh);
   OUTPUT:
@@ -59,8 +59,41 @@ new_memfd(class, name = &PL_sv_undef, n = 0)
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;   /* undef -> default label */
     if (n < 1)
         croak("Data::Fenwick::Shared->new_memfd: n must be >= 1");
-    FenHandle *hh = fen_create_memfd(nm, (uint64_t)n, errbuf);
+    FenHandle *hh = fen_create_memfd(nm, (uint64_t)n, FEN_MODE_POINT, errbuf);
     if (!hh) croak("Data::Fenwick::Shared->new_memfd: %s", errbuf);
+    MAKE_OBJ(class, hh);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_range(class, path = &PL_sv_undef, n = 0, ...)
+    const char *class
+    SV *path
+    UV n
+  PREINIT:
+    char errbuf[FEN_ERR_BUFLEN];
+  CODE:
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (n < 1) croak("Data::Fenwick::Shared->new_range: n must be >= 1");
+    mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    FenHandle *hh = fen_create(p, (uint64_t)n, FEN_MODE_RANGE, mode, errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new_range: %s", errbuf);
+    MAKE_OBJ(class, hh);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_range_memfd(class, name = &PL_sv_undef, n = 0)
+    const char *class
+    SV *name
+    UV n
+  PREINIT:
+    char errbuf[FEN_ERR_BUFLEN];
+  CODE:
+    const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
+    if (n < 1) croak("Data::Fenwick::Shared->new_range_memfd: n must be >= 1");
+    FenHandle *hh = fen_create_memfd(nm, (uint64_t)n, FEN_MODE_RANGE, errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new_range_memfd: %s", errbuf);
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -99,7 +132,25 @@ update(self, i, delta)
   CODE:
     CHECK_POS(i);
     fen_rwlock_wrlock(h);
-    fen_update_locked(h, (uint64_t)i, (int64_t)delta);
+    fen_add1_locked(h, (uint64_t)i, (int64_t)delta);   /* point add (range mode: range_add(i,i)) */
+    __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
+    fen_rwlock_wrunlock(h);
+
+void
+range_add(self, l, r, delta)
+    SV *self
+    UV l
+    UV r
+    IV delta
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->mode != FEN_MODE_RANGE)
+        croak("Data::Fenwick::Shared->range_add: requires a range-mode tree (new_range); a point tree only supports update()");
+    if (l < 1 || r > h->hdr->n || l > r)
+        croak("Data::Fenwick::Shared->range_add: bad range %" UVuf "..%" UVuf " (valid 1..%" UVuf ")", (UV)l, (UV)r, (UV)h->hdr->n);
+    fen_rwlock_wrlock(h);
+    fen_range_add_locked(h, (uint64_t)l, (uint64_t)r, (int64_t)delta);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
 
@@ -114,8 +165,8 @@ set(self, i, value)
   CODE:
     CHECK_POS(i);
     fen_rwlock_wrlock(h);
-    cur = fen_range_locked(h, (uint64_t)i, (uint64_t)i);       /* current value at i */
-    fen_update_locked(h, (uint64_t)i, (int64_t)value - cur);   /* set to the absolute value */
+    cur = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);         /* current value at i */
+    fen_add1_locked(h, (uint64_t)i, (int64_t)value - cur);     /* set to the absolute value */
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
     RETVAL = (IV)cur;                                          /* return the previous value */
@@ -146,7 +197,7 @@ prefix(self, i)
     if (i > h->hdr->n)
         croak("Data::Fenwick::Shared->prefix: position %" UVuf " out of range 0..%" UVuf, (UV)i, (UV)h->hdr->n);
     fen_rwlock_rdlock(h);
-    s = fen_prefix_locked(h, (uint64_t)i);
+    s = fen_pref_locked(h, (uint64_t)i);
     fen_rwlock_rdunlock(h);
     RETVAL = (IV)s;
   OUTPUT:
@@ -164,7 +215,7 @@ range(self, l, r)
     if (l < 1 || r > h->hdr->n || l > r)
         croak("Data::Fenwick::Shared->range: bad range %" UVuf "..%" UVuf " (valid 1..%" UVuf ")", (UV)l, (UV)r, (UV)h->hdr->n);
     fen_rwlock_rdlock(h);
-    s = fen_range_locked(h, (uint64_t)l, (uint64_t)r);
+    s = fen_rng_locked(h, (uint64_t)l, (uint64_t)r);
     fen_rwlock_rdunlock(h);
     RETVAL = (IV)s;
   OUTPUT:
@@ -180,7 +231,7 @@ point(self, i)
   CODE:
     CHECK_POS(i);
     fen_rwlock_rdlock(h);
-    s = fen_range_locked(h, (uint64_t)i, (uint64_t)i);
+    s = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);
     fen_rwlock_rdunlock(h);
     RETVAL = (IV)s;
   OUTPUT:
@@ -194,7 +245,7 @@ total(self)
     int64_t s;
   CODE:
     fen_rwlock_rdlock(h);
-    s = fen_prefix_locked(h, h->hdr->n);
+    s = fen_pref_locked(h, h->hdr->n);
     fen_rwlock_rdunlock(h);
     RETVAL = (IV)s;
   OUTPUT:
@@ -210,6 +261,8 @@ find(self, target)
   CODE:
     /* smallest position whose prefix sum >= target; n+1 if none. Meaningful when
      * all stored values are non-negative (rank / weighted lookup). */
+    if (h->mode == FEN_MODE_RANGE)
+        croak("Data::Fenwick::Shared->find: not supported on a range-mode tree (no single-BIT binary lift); use a point tree");
     fen_rwlock_rdlock(h);
     pos = fen_lower_bound_locked(h, (int64_t)target);
     fen_rwlock_rdunlock(h);
@@ -230,6 +283,8 @@ merge(self, other)
     if (!o) croak("Attempted to use a destroyed Data::Fenwick::Shared object");
 
     /* n is immutable after creation -- compare lock-free, croak BEFORE allocating */
+    if (h->mode == FEN_MODE_RANGE || o->mode == FEN_MODE_RANGE)
+        croak("Data::Fenwick::Shared->merge: not supported for range-mode trees");
     uint64_t on = o->hdr->n;
     if (on != h->hdr->n)
         croak("Data::Fenwick::Shared->merge: size mismatch (n=%" UVuf " vs n=%" UVuf ")",
@@ -274,6 +329,16 @@ capacity(self)
   OUTPUT:
     RETVAL
 
+int
+is_range(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = (h->mode == FEN_MODE_RANGE) ? 1 : 0;   /* cached mode, no lock */
+  OUTPUT:
+    RETVAL
+
 SV *
 stats(self)
     SV *self
@@ -285,7 +350,7 @@ stats(self)
         int64_t  tot;
         fen_rwlock_rdlock(h);
         nn        = h->hdr->n;
-        tot       = fen_prefix_locked(h, nn);
+        tot       = fen_pref_locked(h, nn);
         ops       = h->hdr->stat_ops;
         fen_rwlock_rdunlock(h);
         mmap_size = (uint64_t)h->mmap_size;
@@ -295,6 +360,7 @@ stats(self)
         hv_stores(hv, "total",     newSViv((IV)tot));
         hv_stores(hv, "ops",       newSVuv((UV)ops));
         hv_stores(hv, "mmap_size", newSVuv((UV)mmap_size));
+        hv_stores(hv, "range",     newSViv(h->mode == FEN_MODE_RANGE ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
