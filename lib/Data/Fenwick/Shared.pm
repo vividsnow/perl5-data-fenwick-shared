@@ -84,8 +84,9 @@ the weighted difference), so a range-mode tree costs B<twice the memory>
 cannot do. C<update($i, $delta)> and C<set> still work (a point update is just
 C<range_add($i, $i, $delta)>). C<find> and C<merge> are B<not> available in range
 mode (the two-BIT layout has no single-BIT binary lift); use a point tree for
-those. The mode is recorded in the header, so a reopened segment stays range mode,
-and it is backward-compatible -- a 0.01 point-mode file opens unchanged.
+those. The mode is recorded in the header, so a reopened segment stays range mode.
+Note that the 0.02 on-disk format is incompatible with 0.01: a file created by
+0.01 cannot be opened and must be recreated.
 
 =head1 METHODS
 
@@ -104,7 +105,9 @@ C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$n> is the number of positions (at least 1); positions are then addressed as
 C<1..$n>. C<new> and C<new_memfd> croak if C<$n> is less than 1 or exceeds the
 tree cap. When reopening an existing file or memfd, the stored C<n> wins and the
-caller's C<$n> argument is ignored. C<new_memfd> creates a Linux memfd
+caller's C<$n> argument is ignored -- but a positive C<$n> placeholder is still
+required, since the constructor validates C<$n> before the stored value wins.
+C<new_memfd> creates a Linux memfd
 (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in another
 process. An optional file B<mode> may be passed as the last argument to C<new>
 (e.g. C<0660>) to opt a newly-created backing file into cross-user sharing; it
@@ -200,6 +203,18 @@ ownership; if a holder dies, the next contender detects the dead owner and
 recovers. Each C<update> is a short O(log n) sequence of int64 stores, so a crash
 leaves the tree consistent up to the last completed operation. B<Limitation>: PID
 reuse is not detected (very unlikely in practice).
+
+Reader-slot exhaustion (slotless readers): dead-process recovery attributes a
+crashed lock holder's contribution through its reader-slot. The slot table holds
+1024 entries (one per concurrent reader process). If more than that many reader
+processes share one mapping at once, a reader that cannot claim a slot proceeds
+"slotless" -- it still takes the read lock but leaves no per-process record. If
+such a slotless reader is then killed while holding the read lock, its share of
+the lock cannot be attributed to a dead process, so writer recovery cannot
+reclaim it and writers may block until the mapping is recreated. Reaching this
+needs more than 1024 concurrent reader processes on one mapping plus a crash in
+the brief read-lock window; the dead-process slot reclaim keeps the table from
+filling with stale entries, so in practice it is very unlikely.
 
 =head1 SEE ALSO
 

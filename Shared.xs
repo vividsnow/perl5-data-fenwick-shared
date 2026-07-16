@@ -9,7 +9,8 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::Fenwick::Shared")) \
         croak("Expected a Data::Fenwick::Shared object"); \
     FenHandle *h = INT2PTR(FenHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::Fenwick::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::Fenwick::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -35,13 +36,15 @@ new(class, path = &PL_sv_undef, n = 0, ...)
   PREINIT:
     char errbuf[FEN_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (n < 1)
         croak("Data::Fenwick::Shared->new: n (number of positions) must be >= 1");
     /* Optional 4th arg: file mode for a newly-created file-backed segment
      * (default 0600, owner-only). Pass e.g. 0660 to opt into cross-user
      * sharing. Ignored for anonymous segments and existing files. */
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    /* Capture the path PV last: the get-magic on ST(3) above may run code
+     * that reallocs/frees the path SV's buffer, dangling an earlier pointer. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     FenHandle *hh = fen_create(p, (uint64_t)n, FEN_MODE_POINT, mode, errbuf);
     if (!hh) croak("Data::Fenwick::Shared->new: %s", errbuf);
     MAKE_OBJ(class, hh);
@@ -73,9 +76,11 @@ new_range(class, path = &PL_sv_undef, n = 0, ...)
   PREINIT:
     char errbuf[FEN_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (n < 1) croak("Data::Fenwick::Shared->new_range: n must be >= 1");
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    /* Capture the path PV last: the get-magic on ST(3) above may run code
+     * that reallocs/frees the path SV's buffer, dangling an earlier pointer. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     FenHandle *hh = fen_create(p, (uint64_t)n, FEN_MODE_RANGE, mode, errbuf);
     if (!hh) croak("Data::Fenwick::Shared->new_range: %s", errbuf);
     MAKE_OBJ(class, hh);
