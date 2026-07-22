@@ -70,8 +70,9 @@ DESCRIPTION
     "set" still work (a point update is just "range_add($i, $i, $delta)").
     "find" and "merge" are not available in range mode (the two-BIT layout
     has no single-BIT binary lift); use a point tree for those. The mode is
-    recorded in the header, so a reopened segment stays range mode, and it
-    is backward-compatible -- a 0.01 point-mode file opens unchanged.
+    recorded in the header, so a reopened segment stays range mode. Note
+    that the 0.02 on-disk format is incompatible with 0.01: a file created
+    by 0.01 cannot be opened and must be recreated.
 
 METHODS
   Constructors
@@ -88,11 +89,13 @@ METHODS
     $n is the number of positions (at least 1); positions are then addressed
     as "1..$n". "new" and "new_memfd" croak if $n is less than 1 or exceeds
     the tree cap. When reopening an existing file or memfd, the stored "n"
-    wins and the caller's $n argument is ignored. "new_memfd" creates a
-    Linux memfd (transferable via its "memfd" descriptor); "new_from_fd"
-    reopens one in another process. An optional file mode may be passed as
-    the last argument to "new" (e.g. 0660) to opt a newly-created backing
-    file into cross-user sharing; it defaults to 0600 (owner-only).
+    wins and the caller's $n argument is ignored -- but a positive $n
+    placeholder is still required, since the constructor validates $n before
+    the stored value wins. "new_memfd" creates a Linux memfd (transferable
+    via its "memfd" descriptor); "new_from_fd" reopens one in another
+    process. An optional file mode may be passed as the last argument to
+    "new" (e.g. 0660) to opt a newly-created backing file into cross-user
+    sharing; it defaults to 0600 (owner-only).
 
   Updating
         $fen->update($i, $delta);        # add $delta at position $i (1 <= $i <= n)
@@ -183,6 +186,20 @@ CRASH SAFETY
     int64 stores, so a crash leaves the tree consistent up to the last
     completed operation. Limitation: PID reuse is not detected (very
     unlikely in practice).
+
+    Reader-slot exhaustion (slotless readers): dead-process recovery
+    attributes a crashed lock holder's contribution through its reader-slot.
+    The slot table holds 1024 entries (one per concurrent reader process).
+    If more than that many reader processes share one mapping at once, a
+    reader that cannot claim a slot proceeds "slotless" -- it still takes
+    the read lock but leaves no per-process record. If such a slotless
+    reader is then killed while holding the read lock, its share of the lock
+    cannot be attributed to a dead process, so writer recovery cannot
+    reclaim it and writers may block until the mapping is recreated.
+    Reaching this needs more than 1024 concurrent reader processes on one
+    mapping plus a crash in the brief read-lock window; the dead-process
+    slot reclaim keeps the table from filling with stale entries, so in
+    practice it is very unlikely.
 
 SEE ALSO
     Data::SortedSet::Shared (order-statistics ZSET), Data::NDArray::Shared
