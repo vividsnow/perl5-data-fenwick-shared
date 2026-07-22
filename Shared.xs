@@ -12,6 +12,19 @@
     if (!h) croak("Attempted to use a destroyed Data::Fenwick::Shared object"); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
+
+/* Re-read the handle after a call that can run Perl code. EXTRACT's
+ * sv_2mortal(SvREFCNT_inc(...)) pin only blocks REFCOUNT-driven destruction;
+ * an explicit $obj->DESTROY frees the handle regardless and zeroes the IV.
+ * sv_isobject/sv_derived_from both BEGIN with SvGETMAGIC, so a tied argument
+ * runs Perl there. The same Perl can also REPLACE the invocant ($obj = 42
+ * mutates ST(0), because Perl passes aliases), hence the SvROK re-check. */
+#define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::Fenwick::Shared object was replaced during the call"); \
+    h = INT2PTR(FenHandle*, SvIV(SvRV(sv))); \
+    if (!h) croak("Data::Fenwick::Shared object destroyed during the call")
+
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
     SV *ref = newRV_noinc(obj); \
@@ -286,6 +299,10 @@ merge(self, other)
         croak("Data::Fenwick::Shared->merge: expected a Data::Fenwick::Shared object");
     FenHandle *o = INT2PTR(FenHandle*, SvIV(SvRV(other)));
     if (!o) croak("Attempted to use a destroyed Data::Fenwick::Shared object");
+    /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a
+     * tied `other` can have destroyed self before h is used below. `o` was
+     * read after that magic and needs no re-read. */
+    REEXTRACT(self);
 
     /* n is immutable after creation -- compare lock-free, croak BEFORE allocating */
     if (h->mode == FEN_MODE_RANGE || o->mode == FEN_MODE_RANGE)
