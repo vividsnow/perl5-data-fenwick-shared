@@ -1,6 +1,9 @@
 Revision history for Data-Fenwick-Shared
 
-0.02      2026-07-21
+0.02      2026-07-22
+          - Fix a use-after-free in merge(): sv_isobject on the peer argument
+            runs get-magic, so a tied argument can destroy this object before
+            its handle is used again. Such a call now croaks.
           - Add range-update mode (new_range / range_add; O(log n) range queries).
           - Resolve argument magic before capturing the path string.
           - Correct the POD: 0.02 cannot open a 0.01 file.
