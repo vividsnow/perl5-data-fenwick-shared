@@ -10,6 +10,7 @@
         croak("Expected a Data::Fenwick::Shared object"); \
     FenHandle *h = INT2PTR(FenHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::Fenwick::Shared object"); \
+    FenHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 
@@ -23,7 +24,7 @@
     if (!SvROK(sv)) \
         croak("Data::Fenwick::Shared object was replaced during the call"); \
     h = INT2PTR(FenHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::Fenwick::Shared object destroyed during the call")
+    if (h != h0) croak("Data::Fenwick::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
