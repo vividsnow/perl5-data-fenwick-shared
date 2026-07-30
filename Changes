@@ -1,6 +1,9 @@
 Revision history for Data-Fenwick-Shared
 
 0.02      2026-07-22
+          - Add a frozen read-only mode: freeze() seals a file-backed structure
+            immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
+            it lock-free.
           - Fix a use-after-free in merge(): sv_isobject on the peer argument
             runs get-magic, so a tied argument can destroy this object before
             its handle is used again. Such a call now croaks.

@@ -130,6 +130,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[FEN_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::Fenwick::Shared->new_readonly: path is required");
+    FenHandle *hh = fen_open_readonly(p, errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read: path's get-magic above could have run Perl code */
+    MAKE_OBJ(class, hh);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -149,8 +167,10 @@ update(self, i, delta)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->update: structure is frozen (read-only)");
     CHECK_POS(i);
     fen_rwlock_wrlock(h);
+    if (h->hdr->sealed) { fen_rwlock_wrunlock(h); croak("Data::Fenwick::Shared->update: structure is frozen (read-only)"); }
     fen_add1_locked(h, (uint64_t)i, (int64_t)delta);   /* point add (range mode: range_add(i,i)) */
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
@@ -164,11 +184,13 @@ range_add(self, l, r, delta)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->range_add: structure is frozen (read-only)");
     if (h->mode != FEN_MODE_RANGE)
         croak("Data::Fenwick::Shared->range_add: requires a range-mode tree (new_range); a point tree only supports update()");
     if (l < 1 || r > h->hdr->n || l > r)
         croak("Data::Fenwick::Shared->range_add: bad range %" UVuf "..%" UVuf " (valid 1..%" UVuf ")", (UV)l, (UV)r, (UV)h->hdr->n);
     fen_rwlock_wrlock(h);
+    if (h->hdr->sealed) { fen_rwlock_wrunlock(h); croak("Data::Fenwick::Shared->range_add: structure is frozen (read-only)"); }
     fen_range_add_locked(h, (uint64_t)l, (uint64_t)r, (int64_t)delta);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
@@ -182,8 +204,10 @@ set(self, i, value)
     EXTRACT(self);
     int64_t cur;
   CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->set: structure is frozen (read-only)");
     CHECK_POS(i);
     fen_rwlock_wrlock(h);
+    if (h->hdr->sealed) { fen_rwlock_wrunlock(h); croak("Data::Fenwick::Shared->set: structure is frozen (read-only)"); }
     cur = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);         /* current value at i */
     fen_add1_locked(h, (uint64_t)i, (int64_t)value - cur);     /* set to the absolute value */
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -198,10 +222,42 @@ clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->clear: structure is frozen (read-only)");
     fen_rwlock_wrlock(h);
+    if (h->hdr->sealed) { fen_rwlock_wrunlock(h); croak("Data::Fenwick::Shared->clear: structure is frozen (read-only)"); }
     fen_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->freeze: cannot freeze a read-only handle");
+    if (fen_freeze(h) != 0) croak("Data::Fenwick::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 # ---- query ----
 
@@ -215,9 +271,13 @@ prefix(self, i)
   CODE:
     if (i > h->hdr->n)
         croak("Data::Fenwick::Shared->prefix: position %" UVuf " out of range 0..%" UVuf, (UV)i, (UV)h->hdr->n);
-    fen_rwlock_rdlock(h);
-    s = fen_pref_locked(h, (uint64_t)i);
-    fen_rwlock_rdunlock(h);
+    if (h->readonly) {
+        s = fen_pref_locked(h, (uint64_t)i);
+    } else {
+        fen_rwlock_rdlock(h);
+        s = fen_pref_locked(h, (uint64_t)i);
+        fen_rwlock_rdunlock(h);
+    }
     RETVAL = (IV)s;
   OUTPUT:
     RETVAL
@@ -233,9 +293,13 @@ range(self, l, r)
   CODE:
     if (l < 1 || r > h->hdr->n || l > r)
         croak("Data::Fenwick::Shared->range: bad range %" UVuf "..%" UVuf " (valid 1..%" UVuf ")", (UV)l, (UV)r, (UV)h->hdr->n);
-    fen_rwlock_rdlock(h);
-    s = fen_rng_locked(h, (uint64_t)l, (uint64_t)r);
-    fen_rwlock_rdunlock(h);
+    if (h->readonly) {
+        s = fen_rng_locked(h, (uint64_t)l, (uint64_t)r);
+    } else {
+        fen_rwlock_rdlock(h);
+        s = fen_rng_locked(h, (uint64_t)l, (uint64_t)r);
+        fen_rwlock_rdunlock(h);
+    }
     RETVAL = (IV)s;
   OUTPUT:
     RETVAL
@@ -249,9 +313,13 @@ point(self, i)
     int64_t s;
   CODE:
     CHECK_POS(i);
-    fen_rwlock_rdlock(h);
-    s = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);
-    fen_rwlock_rdunlock(h);
+    if (h->readonly) {
+        s = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);
+    } else {
+        fen_rwlock_rdlock(h);
+        s = fen_rng_locked(h, (uint64_t)i, (uint64_t)i);
+        fen_rwlock_rdunlock(h);
+    }
     RETVAL = (IV)s;
   OUTPUT:
     RETVAL
@@ -263,9 +331,13 @@ total(self)
     EXTRACT(self);
     int64_t s;
   CODE:
-    fen_rwlock_rdlock(h);
-    s = fen_pref_locked(h, h->hdr->n);
-    fen_rwlock_rdunlock(h);
+    if (h->readonly) {
+        s = fen_pref_locked(h, h->hdr->n);
+    } else {
+        fen_rwlock_rdlock(h);
+        s = fen_pref_locked(h, h->hdr->n);
+        fen_rwlock_rdunlock(h);
+    }
     RETVAL = (IV)s;
   OUTPUT:
     RETVAL
@@ -282,9 +354,13 @@ find(self, target)
      * all stored values are non-negative (rank / weighted lookup). */
     if (h->mode == FEN_MODE_RANGE)
         croak("Data::Fenwick::Shared->find: not supported on a range-mode tree (no single-BIT binary lift); use a point tree");
-    fen_rwlock_rdlock(h);
-    pos = fen_lower_bound_locked(h, (int64_t)target);
-    fen_rwlock_rdunlock(h);
+    if (h->readonly) {
+        pos = fen_lower_bound_locked(h, (int64_t)target);
+    } else {
+        fen_rwlock_rdlock(h);
+        pos = fen_lower_bound_locked(h, (int64_t)target);
+        fen_rwlock_rdunlock(h);
+    }
     RETVAL = (UV)pos;
   OUTPUT:
     RETVAL
@@ -296,6 +372,7 @@ merge(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Fenwick::Shared->merge: structure is frozen (read-only)");
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::Fenwick::Shared"))
         croak("Data::Fenwick::Shared->merge: expected a Data::Fenwick::Shared object");
     FenHandle *o = INT2PTR(FenHandle*, SvIV(SvRV(other)));
@@ -321,11 +398,16 @@ merge(self, other)
     int64_t *tmp;
     Newx(tmp, (size_t)slots, int64_t);
     SAVEFREEPV(tmp);                 /* freed on normal return OR croak unwind */
-    fen_rwlock_rdlock(o);
-    memcpy(tmp, fen_tree(o), (size_t)slots * sizeof(int64_t));
-    fen_rwlock_rdunlock(o);
+    if (o->readonly) {                     /* frozen other: immutable tree, no lock */
+        memcpy(tmp, fen_tree(o), (size_t)slots * sizeof(int64_t));
+    } else {
+        fen_rwlock_rdlock(o);
+        memcpy(tmp, fen_tree(o), (size_t)slots * sizeof(int64_t));
+        fen_rwlock_rdunlock(o);
+    }
 
     fen_rwlock_wrlock(h);
+    if (h->hdr->sealed) { fen_rwlock_wrunlock(h); croak("Data::Fenwick::Shared->merge: structure is frozen (read-only)"); }
     fen_merge_locked(h, tmp, slots);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     fen_rwlock_wrunlock(h);
@@ -371,11 +453,11 @@ stats(self)
     {
         uint64_t nn, ops, mmap_size;
         int64_t  tot;
-        fen_rwlock_rdlock(h);
+        if (!h->readonly) fen_rwlock_rdlock(h);
         nn        = h->hdr->n;
         tot       = fen_pref_locked(h, nn);
         ops       = h->hdr->stat_ops;
-        fen_rwlock_rdunlock(h);
+        if (!h->readonly) fen_rwlock_rdunlock(h);
         mmap_size = (uint64_t)h->mmap_size;
 
         HV *hv = newHV();
@@ -384,6 +466,8 @@ stats(self)
         hv_stores(hv, "ops",       newSVuv((UV)ops));
         hv_stores(hv, "mmap_size", newSVuv((UV)mmap_size));
         hv_stores(hv, "range",     newSViv(h->mode == FEN_MODE_RANGE ? 1 : 0));
+        hv_stores(hv, "frozen",    newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",  newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -415,7 +499,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (fen_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && fen_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)

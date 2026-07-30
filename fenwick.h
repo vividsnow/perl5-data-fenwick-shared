@@ -96,7 +96,8 @@ struct FenHeader {
     uint32_t drain_seq;               /* 80  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* readers holding with no reader-slot (documented residual) */
     uint64_t stat_ops;                /* 88 */
-    uint8_t  _pad[160];               /* 96..255 */
+    uint8_t  sealed;                  /* 96  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[159];               /* 97..255 */
 };
 typedef struct FenHeader FenHeader;
 
@@ -119,6 +120,7 @@ typedef struct FenHandle {
     uint32_t      cached_pid;    /* getpid() cached at last slot claim */
     uint32_t      cached_fork_gen; /* fen_fork_gen value at last slot claim */
     uint32_t slotless_held; /* read-locks this process holds with no reader-slot */
+    int      readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } FenHandle;
 
 /* ================================================================
@@ -659,6 +661,10 @@ static FenHandle *fen_create(const char *path, uint64_t n, uint32_t fmode, mode_
             if (!fen_validate_header((FenHeader *)base, (uint64_t)st.st_size)) {
                 FEN_ERR("invalid Fenwick tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((FenHeader *)base)->sealed) {
+                FEN_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return fen_setup(base, map_size, path, -1);
         }
@@ -695,9 +701,43 @@ static FenHandle *fen_open_fd(int fd, char *errbuf) {
     if (!fen_validate_header((FenHeader *)base, (uint64_t)st.st_size)) {
         FEN_ERR("invalid Fenwick tree table"); munmap(base, ms); return NULL;
     }
+    if (((FenHeader *)base)->sealed) {
+        FEN_ERR("this Fenwick tree is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { FEN_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return fen_setup(base, ms, NULL, myfd);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * The tree array + geometry are immutable in a sealed file, so prefix/range/point
+ * queries read directly with no reader-slot / rwlock traffic -- the mapping is
+ * never written, so it works from a read-only fd / read-only filesystem and can
+ * be shared PROT_READ across processes (same architecture; the native magic
+ * rejects a wrong-endian file at validation). */
+static FenHandle *fen_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { FEN_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { FEN_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(FenHeader)) { FEN_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { FEN_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!fen_validate_header((FenHeader *)base, (uint64_t)st.st_size)) {
+        FEN_ERR("%s: invalid Fenwick tree file", path); munmap(base, ms); return NULL;
+    }
+    if (!((FenHeader *)base)->sealed) {
+        FEN_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    FenHandle *h = fen_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { FEN_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
 }
 
 static void fen_destroy(FenHandle *h) {
@@ -725,6 +765,18 @@ static void fen_destroy(FenHandle *h) {
 static inline int fen_msync(FenHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* Seal a tree: make it permanently immutable so it can be shipped and opened
+ * read-only.  Takes the write lock so no update is in flight, publishes the
+ * seal, then flushes it (file/memfd-backed).  Afterwards every mutator croaks
+ * and a read-write reopen is refused. */
+static int fen_freeze(FenHandle *h) {
+    fen_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    fen_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return fen_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 /* ================================================================
