@@ -60,7 +60,7 @@ new(class, path = &PL_sv_undef, n = 0, ...)
      * that reallocs/frees the path SV's buffer, dangling an earlier pointer. */
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     FenHandle *hh = fen_create(p, (uint64_t)n, FEN_MODE_POINT, mode, errbuf);
-    if (!hh) croak("Data::Fenwick::Shared->new: %s", errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -77,7 +77,7 @@ new_memfd(class, name = &PL_sv_undef, n = 0)
     if (n < 1)
         croak("Data::Fenwick::Shared->new_memfd: n must be >= 1");
     FenHandle *hh = fen_create_memfd(nm, (uint64_t)n, FEN_MODE_POINT, errbuf);
-    if (!hh) croak("Data::Fenwick::Shared->new_memfd: %s", errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -125,7 +125,7 @@ new_from_fd(class, fd)
     char errbuf[FEN_ERR_BUFLEN];
   CODE:
     FenHandle *hh = fen_open_fd(fd, errbuf);
-    if (!hh) croak("Data::Fenwick::Shared->new_from_fd: %s", errbuf);
+    if (!hh) croak("Data::Fenwick::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
