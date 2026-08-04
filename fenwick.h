@@ -659,6 +659,23 @@ static FenHandle *fen_create(const char *path, uint64_t n, uint32_t fmode, mode_
         if (base == MAP_FAILED) { FEN_ERR("mmap: %s", strerror(errno)); flock(fd, LOCK_UN); close(fd); return NULL; }
         if (!is_new) {
             if (!fen_validate_header((FenHeader *)base, (uint64_t)st.st_size)) {
+                /* Recover an abandoned mid-init file: a creator killed between the
+                 * ftruncate and fen_init_header below leaves a full-size, all-zero
+                 * (magic==0) file that would otherwise brick every future open of
+                 * this path.  Re-initialize it, but ONLY when it is exactly our
+                 * size, still uninitialized (magic==0), and owned by us -- a valid
+                 * or foreign file fails this and still errors, never clobbered. */
+                if (((FenHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    if (fchmod(fd, mode) < 0) {
+                        FEN_ERR("%s: fchmod: %s", path, strerror(errno));
+                        munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+                    }
+                    memset(base, 0, map_size);   /* start from a provably empty tree */
+                    fen_init_header(base, n, fmode, total);
+                    flock(fd, LOCK_UN); close(fd);
+                    return fen_setup(base, map_size, path, -1);
+                }
                 FEN_ERR("invalid Fenwick tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
             if (((FenHeader *)base)->sealed) {
