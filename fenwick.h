@@ -685,7 +685,6 @@ static FenHandle *fen_create(const char *path, uint64_t n, uint32_t fmode, mode_
                         FEN_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty tree */
                     fen_init_header(base, n, fmode, total);
                     flock(fd, LOCK_UN); close(fd);
                     return fen_setup(base, map_size, path, -1);
