@@ -1,7 +1,7 @@
 package Data::Fenwick::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 require XSLoader;
 XSLoader::load('Data::Fenwick::Shared', $VERSION);
 
@@ -13,7 +13,8 @@ __END__
 
 =head1 NAME
 
-Data::Fenwick::Shared - shared-memory Fenwick tree (binary indexed tree; point or range update) for Linux
+Data::Fenwick::Shared - shared-memory Fenwick tree (binary indexed tree; point
+or range update) for Linux
 
 =head1 SYNOPSIS
 
@@ -110,15 +111,17 @@ Note that the 0.02 on-disk format is incompatible with 0.01: a file created by
 C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$n> is the number of positions (at least 1); positions are then addressed as
 C<1..$n>. C<new> and C<new_memfd> croak if C<$n> is less than 1 or exceeds the
-tree cap. When reopening an existing file or memfd, the stored C<n> wins and the
-caller's C<$n> argument is ignored -- but a positive C<$n> placeholder is still
-required, since the constructor validates C<$n> before the stored value wins.
-C<new_memfd> creates a Linux memfd
-(transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in another
-process. C<new_readonly> opens a B<frozen> file read-only for lock-free querying
-(see L</"FROZEN (READ-ONLY) MODE">). An optional file B<mode> may be passed as
-the last argument to C<new> (e.g. C<0660>) to opt a newly-created backing file
-into cross-user sharing; it defaults to C<0600> (owner-only).
+tree cap. When reopening an existing file or memfd, the stored C<n> wins and
+the caller's C<$n> argument is ignored -- but a positive C<$n> placeholder is
+still required, since the constructor validates C<$n> before the stored value
+wins. C<new_memfd> creates a Linux memfd (transferable via its C<memfd>
+descriptor); C<new_from_fd> reopens one in another process. The descriptor you
+pass is duplicated (C<F_DUPFD_CLOEXEC>), so it stays yours to close and
+closing it does not disturb the handle. C<new_readonly> opens a B<frozen> file
+read-only for lock-free querying (see L</"FROZEN (READ-ONLY) MODE">). An
+optional file B<mode> may be passed as the last argument to C<new> (e.g.
+C<0660>) to opt a newly-created backing file into cross-user sharing; it
+defaults to C<0600> (owner-only).
 
 =head2 Updating
 
@@ -161,12 +164,13 @@ B<point-mode> tree (it croaks in range mode).
 
 C<merge> adds another tree's contents into this one position by position; both
 trees must have the same C<n> or it croaks, and both must be B<point-mode>
-(C<merge> croaks in range mode). The other tree is snapshotted under its own read
-lock, so two processes may merge concurrently without deadlock. C<is_range>
-reports whether the tree is range mode. C<size> (also C<capacity>) is C<n>. C<sync> flushes the mapping to its backing
-store (a no-op for anonymous and memfd trees); C<unlink> removes the backing file
-(also callable as C<< Class->unlink($path) >>); C<path> returns the backing path
-(C<undef> for anonymous, memfd, or fd-reopened trees) and C<memfd> the backing
+(C<merge> croaks in range mode). The other tree is snapshotted under its own
+read lock, so two processes may merge concurrently without deadlock.
+C<is_range> reports whether the tree is range mode. C<size> (also C<capacity>)
+is C<n>. C<sync> flushes the mapping to its backing store (a no-op for
+anonymous and memfd trees); C<unlink> removes the backing file (also callable
+as C<< Class->unlink($path) >>); C<path> returns the backing path (C<undef>
+for anonymous, memfd, or fd-reopened trees) and C<memfd> the backing
 descriptor -- the memfd of a C<new_memfd> tree or the dup'd fd of a
 C<new_from_fd> tree, and -1 for file-backed or anonymous trees.
 
@@ -238,12 +242,14 @@ filesystem: the lock is a Linux futex (process-local to one kernel), and the
 
 =head1 SECURITY
 
-Backing files are created with mode C<0600> (owner-only) by default. To share a
-backing file across users, pass an explicit octal file mode such as C<0660> as
-the last argument to C<new>; the mode is applied only when the file is created.
-The file is opened with C<O_NOFOLLOW> (a symlink at the path is refused) and
-C<O_EXCL>; the on-disk header is validated when the file is attached. Any process
-you grant write access to a shared mapping is trusted not to corrupt it while
+Backing files are created with mode C<0600> (owner-only) by default. To share
+a backing file across users, pass an explicit octal file mode such as C<0660>
+as the last argument to C<new>; the mode is applied when the file is created,
+and when a file left behind by an interrupted create is re-initialized (see
+L</CRASH SAFETY>); a file already in use keeps its own permissions. The file
+is opened with C<O_NOFOLLOW> (a symlink at the path is refused) and C<O_EXCL>;
+the on-disk header is validated when the file is attached. Any process you
+grant write access to a shared mapping is trusted not to corrupt it while
 others are using it.
 
 =head1 CRASH SAFETY
@@ -265,6 +271,18 @@ reclaim it and writers may block until the mapping is recreated. Reaching this
 needs more than 1024 concurrent reader processes on one mapping plus a crash in
 the brief read-lock window; the dead-process slot reclaim keeps the table from
 filling with stale entries, so in practice it is very unlikely.
+
+An interrupted create is recovered too. A creator killed after the backing
+file is sized but before its header is committed leaves a full-size, all-zero
+file. C<new> re-initializes such a file automatically, but only when it is
+exactly the size the requested geometry needs, is owned by your effective uid,
+and is still entirely zero -- a file holding data is never re-initialized. If
+the creator got as far as writing part of the header, the file cannot be told
+apart from a corrupt one and C<new> croaks with C<incomplete Fenwick tree file
+left by an interrupted create; remove it and retry>. A file left behind by an
+interrupted create never held data, so removing it is safe -- but a file whose
+header was corrupted after the fact reaches the same croak, so confirm it is
+an abandoned create before deleting anything you care about.
 
 =head1 SEE ALSO
 
